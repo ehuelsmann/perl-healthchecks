@@ -1,0 +1,47 @@
+[Unit]
+Description=Efficito Health monitoring daemon
+AssertPathExists=/var/lib/healthchecks
+AssertPathExists=/etc/healthchecks
+
+[Service]
+Type=Simple
+User=healthcheck
+Group=healthcheck
+WorkingDirectory=/var/lib/healthchecks
+ExecStart=/usr/bin/perl /usr/local/bin/healthchecks daemon -l http://127.0.0.1:3000
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=always
+RestartSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=healthchecks
+
+# Security settings
+NoNewPrivileges=false
+SupplementaryGroups=postdrop
+PrivateTmp=yes
+ProtectSystem=true
+ReadWritePaths=/var/lib/healthchecks /var/spool/postfix/maildrop
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET
+
+# Environment
+EnvironmentFile=/etc/healthchecks/environment.conf
+
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,522 @@
+#!/usr/bin/env perl
+
+# Perl-based Cron Job Monitoring Service
+# Similar to healthchecks.io but written in Perl
+#
+# Requirements:
+# cpanm Mojolicious DBI DBD::SQLite DateTime Email::Sender::Simple Email::Simple
+
+use strict;
+use warnings;
+use v5.20;
+
+use Mojolicious::Lite -signatures;
+use DBI;
+use DateTime;
+use UUID::Tiny ':std';
+use Email::Sender::Simple qw(sendmail);
+use Email::Simple;
+use JSON qw(encode_json decode_json);
+use Data::Dumper;
+use MIME::Base64 qw(encode_base64);
+
+# Configuration
+my $DB_FILE = 'healthchecks.db';
+my $SMTP_HOST = $ENV{SMTP_HOST} || 'localhost';
+my $FROM_EMAIL = $ENV{FROM_EMAIL} || 'healthchecks@localhost';
+my $BASE_URL = $ENV{BASE_URL} || 'http://localhost:3000';
+my $API_KEY = $ENV{API_KEY} || '00000000-0000-0000-0000-000000000000';
+my $ADMIN_USER = $ENV{ADMIN_USER} || 'admin';
+my $ADMIN_PASS = $ENV{ADMIN_PASS} || 'pass';
+
+# Database setup
+my $dbh = DBI->connect("dbi:SQLite:dbname=$DB_FILE", "", "", {
+    RaiseError => 1,
+    AutoCommit => 1,
+});
+
+# Set base URL from environment variable
+if (my $base_url = $BASE_URL) {
+    app->config(base_url => $base_url);
+    # Configure the URL base for the application
+    app->hook(before_dispatch => sub {
+        my $c = shift;
+        $c->req->url->base(Mojo::URL->new($base_url));
+    });
+}
+
+# Initialize database
+$dbh->do(qq{
+    CREATE TABLE IF NOT EXISTS checks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uuid TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        period INTEGER NOT NULL DEFAULT 3600,
+        grace INTEGER NOT NULL DEFAULT 900,
+        last_ping DATETIME,
+        status TEXT DEFAULT 'new',
+        failure_count INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+});
+
+$dbh->do(qq{
+    CREATE TABLE IF NOT EXISTS pings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        check_uuid TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        method TEXT,
+        status TEXT,
+        user_agent TEXT,
+        body TEXT,
+        exit_status INTEGER,
+        FOREIGN KEY (check_uuid) REFERENCES checks(uuid)
+    )
+});
+
+# Helper functions
+sub get_check_by_uuid($uuid) {
+    my $sth = $dbh->prepare("SELECT * FROM checks WHERE uuid = ?");
+    $sth->execute($uuid);
+    return $sth->fetchrow_hashref;
+}
+
+sub update_check_status($uuid, $status, $ping_data = {}) {
+    my $now = DateTime->now->strftime('%Y-%m-%d %H:%M:%S');
+
+    $dbh->do(
+        "UPDATE checks SET status = ?, last_ping = ?, updated_at = ? WHERE uuid = ?",
+        undef, $status, $now, $now, $uuid
+    );
+
+    # Log the ping
+    $dbh->do(
+        "INSERT INTO pings (check_uuid, method, status, user_agent, body, exit_status) VALUES (?, ?, ?, ?, ?, ?)",
+        undef, $uuid, $ping_data->{method}, $status, $ping_data->{user_agent}, $ping_data->{body}, $ping_data->{exit_status}
+    );
+}
+
+sub send_alert($check, $message) {
+    my $proc = Mojo::IOLoop->subprocess(
+        sub {
+            my $email = Email::Simple->create(
+                header => [
+                    To      => $ENV{ALERT_EMAIL} || 'admin@localhost',
+                    From    => $FROM_EMAIL,
+                    Subject => "Healthcheck Alert: $check->{name}",
+                ],
+                body => $message,
+                );
+
+            eval { sendmail($email) };
+            warn "Failed to send alert: $@" if $@;
+        });
+}
+
+sub check_overdue_jobs() {
+    my $now = DateTime->now;
+    my $sth = $dbh->prepare(qq{
+        SELECT * FROM checks
+        WHERE status IN ('up', 'grace')
+        AND datetime(last_ping, '+' || period || ' seconds', '+' || grace || ' seconds') < datetime('now')
+    });
+    $sth->execute();
+
+    while (my $check = $sth->fetchrow_hashref) {
+        $dbh->do("UPDATE checks SET status = 'down', failure_count = failure_count + 1 WHERE uuid = ?",
+                 undef, $check->{uuid});
+
+        my $message = "Check '$check->{name}' has gone down.\n";
+        $message .= "Last ping: $check->{last_ping}\n";
+        $message .= "Expected every $check->{period} seconds\n";
+        $message .= "Grace period: $check->{grace} seconds\n";
+        $message .= "View details: $BASE_URL/checks/$check->{uuid}\n";
+
+        send_alert($check, $message);
+    }
+}
+
+# Routes
+
+my $basic_auth_cache = 'Basic ' . encode_base64( "$ADMIN_USER:$ADMIN_PASS" );
+chomp $basic_auth_cache;
+
+sub verify_checks_auth($c) {
+    my $auth = $c->req->headers->authorization;
+
+    if ($auth) {
+        return 1 if $auth eq "Bearer $API_KEY"; # successful authentication
+        $c->app->log->debug( "Checking authentication against: '$basic_auth_cache'" );
+        $c->app->log->debug( "Checked authentication           '$auth'" );
+        return 1 if $auth eq $basic_auth_cache;
+        $c->app->log->debug( "Falling through" );
+    }
+
+    $c->res->headers->www_authenticate('Basic realm="Health checks"');
+    $c->render(text => 'Authentication required', status => 401);
+    return undef;
+}
+
+sub verify_api_auth($c) {
+    my $auth = $c->req->headers->authorization;
+
+    unless ($auth) {
+        $c->render(text => 'Not authorized for submission', status => 401);
+        return undef;
+    }
+
+    unless ($auth eq "Bearer $API_KEY") {
+        $c->render(text => 'Failed authentication', status => 403);
+        unless undef;
+    }
+
+    return 1;
+}
+
+# Dashboard
+get '/' => sub ($c) {
+    return unless verify_checks_auth($c);
+
+    my $sth = $dbh->prepare("SELECT * FROM checks ORDER BY status, last_ping");
+    $sth->execute();
+    my $checks = $sth->fetchall_arrayref({});
+
+    $c->render(template => 'dashboard', checks => $checks);
+};
+
+
+# Create new check
+post '/checks' => sub ($c) {
+    return unless verify_checks_auth($c);
+
+    my $name = $c->param('name') || 'Unnamed Check';
+    my $period = $c->param('period') || 3600;
+    my $grace = $c->param('grace') || 900;
+    my $uuid = create_uuid_as_string(UUID_V4);
+
+    $dbh->do(
+        "INSERT INTO checks (uuid, name, period, grace) VALUES (?, ?, ?, ?)",
+        undef, $uuid, $name, $period, $grace
+    );
+
+    $c->redirect_to("/checks/$uuid");
+};
+
+# Check details
+get '/checks/:uuid' => sub ($c) {
+    return unless verify_checks_auth($c);
+
+    my $uuid = $c->param('uuid');
+    my $check = get_check_by_uuid($uuid);
+
+    return $c->render(text => 'Check not found', status => 404) unless $check;
+
+    # Get recent pings
+    my $sth = $dbh->prepare("SELECT * FROM pings WHERE check_uuid = ? ORDER BY id DESC LIMIT 20");
+    $sth->execute($uuid);
+    my $pings = $sth->fetchall_arrayref({});
+
+    if (@$pings and
+        my $last_ping_body = $pings->[0]->{body}) {
+        my @clipped_body = split( /\n/, substr( $last_ping_body, 0, 1000 ), 6 );
+        if (@clipped_body == 6) {
+            $clipped_body[5] = '  ... clipped ...';
+        }
+
+        $check->{last_ping_id} = $pings->[0]->{id};
+        $check->{clipped_body} = join("\n", @clipped_body);
+    }
+
+    $c->render(template => 'check_detail', check => $check, pings => $pings);
+};
+
+get '/checks/:uuid/:ping_id/body' => sub ($c) {
+    return unless verify_checks_auth($c);
+
+    my $uuid    = $c->param('uuid');
+    my $ping_id = $c->param('ping_id');
+
+    my $sth = $dbh->prepare("SELECT * FROM pings WHERE check_uuid = ? AND id = ?");
+    $sth->execute($uuid, $ping_id);
+    my $pings = $sth->fetchall_arrayref({});
+    return $c->render(text => 'Ping not found', status => 404) unless @$pings;
+
+    my ($ping, ) = @$pings;
+    $c->res->headers->content_type('text/plain');
+    $c->res->body($ping->{body});
+    $c->rendered(200);
+};
+
+# Ping endpoints
+any '/ping/:uuid' => sub ($c) {
+    return undef unless verify_api_auth($c);
+
+    my $uuid = $c->param('uuid');
+    my $check = get_check_by_uuid($uuid);
+    return $c->render(text => 'Check not found', status => 404) unless $check;
+
+    my $ping_data = {
+        method => $c->req->method,
+        user_agent => $c->req->headers->user_agent || '',
+        body => $c->req->body,
+        exit_status => 0
+    };
+
+    update_check_status($uuid, 'up', $ping_data);
+
+    $c->render(text => 'OK');
+};
+
+any '/ping/:uuid/fail' => sub ($c) {
+    return undef unless verify_api_auth($c);
+
+    my $uuid = $c->param('uuid');
+    my $check = get_check_by_uuid($uuid);
+    return $c->render(text => 'Check not found', status => 404) unless $check;
+
+    my $ping_data = {
+        method => $c->req->method,
+        user_agent => $c->req->headers->user_agent || '',
+        body => $c->req->body,
+        exit_status => 1
+    };
+
+    update_check_status($uuid, 'down', $ping_data);
+
+    # Send immediate alert
+    my $message = "Check '$check->{name}' has failed.\n";
+    $message .= "Body:\n" . ($ping_data->{body} || 'No body') . "\n";
+    send_alert($check, $message);
+
+    $c->render(text => 'Failure recorded');
+};
+
+any '/ping/:uuid/start' => sub ($c) {
+    return undef unless verify_api_auth($c);
+
+    my $uuid = $c->param('uuid');
+    my $check = get_check_by_uuid($uuid);
+    return $c->render(text => 'Check not found', status => 404) unless $check;
+
+    my $ping_data = {
+        method => $c->req->method,
+        user_agent => $c->req->headers->user_agent || '',
+        body => 'Job started',
+        exit_status => undef
+    };
+
+    update_check_status($uuid, 'grace', $ping_data);
+
+    $c->render(text => 'Start recorded');
+};
+
+# API endpoints
+get '/api/checks' => sub ($c) {
+    return undef unless verify_api_auth($c);
+
+    my $sth = $dbh->prepare("SELECT * FROM checks ORDER BY created_at DESC");
+    $sth->execute();
+    my $checks = $sth->fetchall_arrayref({});
+
+    $c->render(json => $checks);
+};
+
+# Background job to check for overdue jobs
+Mojo::IOLoop->recurring(60 => sub { check_overdue_jobs() });
+
+# Start the application
+app->start;
+
+__DATA__
+
+@@ dashboard.html.ep
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Healthchecks</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .check { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 5px; }
+        .status-up { background-color: #d4edda; border-color: #c3e6cb; display: inline-block; padding: 2px; text-align: center; width: 100%; }
+        .status-down { background-color: #f8d7da; border-color: #f5c6cb; display: inline-block; font-weight: 900; padding: 2px; text-align: center; width: 100%; }
+        .status-new { background-color: #d1ecf1; border-color: #bee5eb; display: inline-block; padding: 2px; text-align: center; width: 100%; }
+        .status-grace { background-color: #fff3cd; border-color: #ffeaa7; display: inline-block; font-weight: 600; padding: 2px; text-align: center; width: 100%; }
+        .form-group { margin: 10px 0; }
+        .btn { padding: 10px 15px; background: #007bff; color: white; border: none; border-radius: 3px; cursor: pointer; }
+        .btn:hover { background: #0056b3; }
+        .uuid { font-family: monospace; font-size: 0.9em; color: #666; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th.status, th.period { text-align: center }
+        td.period { text-align: right }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f8f9fa; }
+        @media only screen and (max-width: 600px) {
+           th.period, th.uuid, th.details-link, td.period, td.uuid, td.details-link {
+             display: none
+           }
+        }
+        @media only screen and (max-width: 800px) {
+           th.uuid, td.uuid {
+             display: none
+           }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Healthchecks Dashboard</h1>
+
+        <div style="background: #f8f9fa; padding: 20px; border-radius: 5px; margin-bottom: 20px;">
+            <h3>Add New Check</h3>
+            <form method="post" action="<%= url_for('/checks') %>">
+                <div class="form-group">
+                    <label>Name:</label>
+                    <input type="text" name="name" required style="width: 300px; padding: 5px;">
+                </div>
+                <div class="form-group">
+                    <label>Period (seconds):</label>
+                    <input type="number" name="period" value="3600" style="width: 100px; padding: 5px;">
+                </div>
+                <div class="form-group">
+                    <label>Grace Period (seconds):</label>
+                    <input type="number" name="grace" value="900" style="width: 100px; padding: 5px;">
+                </div>
+                <button type="submit" class="btn">Create Check</button>
+            </form>
+        </div>
+
+        <h2>Checks (<%= scalar(@$checks) %>)</h2>
+
+        % if (@$checks) {
+            <table>
+                <tr>
+                    <th>Name</th>
+                    <th class="status">Status</th>
+                    <th>Last Ping</th>
+                    <th class="period">Period</th>
+                    <th class="uuid">UUID</th>
+                    <th class="details-link"></th>
+                </tr>
+                % for my $check (@$checks) {
+                    <tr>
+                        <td><%= $check->{name} %></td>
+                        <td class="status"><span class="status-<%= $check->{status} %>"><%= uc($check->{status}) %></span></td>
+                        <td><%= $check->{last_ping} || 'Never' %></td>
+                        <td class="period"><%= $check->{period} %>s</td>
+                        <td class="uuid"><%= $check->{uuid} %></td>
+                        <td class="details-link"><a href="<%= url_for("/checks/$check->{uuid}") %>">Details</a></td>
+                    </tr>
+                % }
+            </table>
+        % } else {
+            <p>No checks configured yet.</p>
+        % }
+    </div>
+</body>
+</html>
+
+@@ check_detail.html.ep
+<!DOCTYPE html>
+<html>
+<head>
+    <title><%= $check->{name} %> - Perl Healthchecks</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .status-up { color: #28a745; font-weight: 900; }
+        .status-down { color: #dc3545; font-weight: 900; }
+        .status-new { color: #17a2b8; font-weight: 900; }
+        .status-grace { color: #ffc107; font-weight: 900; }
+        .ping-url { background: #f8f9fa; padding: 10px; border-radius: 3px; font-family: monospace; margin: 10px 0; }
+        .ping-log { background: #f8f9fa; padding: 10px; border-radius: 3px; margin: 10px 0; max-height: 300px; overflow-y: auto; }
+        table { position: relative; width: 100%; border-collapse: collapse; margin-top: 20px; transform: translateZ(0); }
+        thead th { position: sticky; position: -webkit-sticky; top: 0; z-index: 999; transform: translate3d(0,0,0); }
+        td.time { text-wrap: nowrap }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f8f9fa; }
+        .back-link { color: #007bff; text-decoration: none; }
+        .back-link:hover { text-decoration: underline; }
+        .log-snippet { overflow: scroll; width: 100% }
+        .body-preview {
+           text-overflow: ellipsis;
+           white-space: nowrap;
+           overflow: hidden;
+           max-width: 80em;
+        }
+        .user-agent {
+           white-space: nowrap;
+        }
+        @media only screen and (max-width: 600px) {
+          th.user-agent, td.user-agent, th.body-preview, td.body-preview {
+            display: none;
+          }
+        }
+        @media only screen and (max-width: 800px) {
+          th.body-preview, td.body-preview {
+            display: none;
+          }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="<%= url_for('/') %>" class="back-link">← Back to Dashboard</a>
+
+        <h1><%= $check->{name} %></h1>
+
+        <div style="background: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0;">
+            <div style="display:grid; grid-template-columns: max-content auto; grid-gap: 1em;">
+               <strong>Status:</strong> <span class="status-<%= $check->{status} %>"><%= uc($check->{status}) %></span>
+            <strong>Last Ping:</strong> <span><%= $check->{last_ping} || 'Never' %></span>
+            <strong>Period:</strong> <span><%= $check->{period} %> seconds</span>
+            <strong>Grace Period:</strong> <span><%= $check->{grace} %> seconds</span>
+            <strong>UUID:</strong> <code><%= $check->{uuid} %></code>
+            </div>
+            % if ($check->{clipped_body}) {
+            <p><strong>Body:</strong> (<a href="<%= url_for("/checks/$check->{uuid}/$check->{last_ping_id}/body") %>">full body</a>)</p>
+            <pre class="log-snippet"><%== $check->{clipped_body} %></pre>
+            % }
+        </div>
+
+        <h3>Ping URLs</h3>
+        <div class="ping-url">
+            <strong>Success:</strong> <code><%= url_for("/ping/$check->{uuid}") %></code><br>
+            <strong>Failure:</strong> <code><%= url_for("/ping/$check->{uuid}/fail") %></code><br>
+            <strong>Start:</strong> <code><%= url_for("/ping/$check->{uuid}/start") %></code>
+        </div>
+
+        <h3>Recent Pings</h3>
+        % if (@$pings) {
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Method</th>
+                        <th>Status</th>
+                        <th class="user-agent">User Agent</th>
+                        <th class="body-preview">Body Preview</th>
+                    </tr>
+                </thead>
+                <tbody>
+                % for my $ping (@$pings) {
+                    <tr>
+                        <td class="time"><%= $ping->{created_at} %></td>
+                        <td><%= $ping->{method} %></td>
+                        <td><%= $ping->{status} %></td>
+                        <td class="user-agent"><%= substr($ping->{user_agent} || '', 0, 50) %></td>
+                        <td class="body-preview"><%= substr($ping->{body} || '', 0, 100) %></td>
+                    </tr>
+                % }
+                </tbody>
+            </table>
+        % } else {
+            <p>No pings recorded yet.</p>
+        % }
+    </div>
+</body>
+</html>
+

@@ -1,0 +1,231 @@
+#!/usr/bin/perl
+
+# Perl Cron Job Wrapper for Healthchecks
+# Usage: perl cron-wrapper.pl <healthcheck_url> <command> [args...]
+
+use strict;
+use warnings;
+use v5.20;
+use experimental qw(signatures);
+
+use HTTP::Tiny;
+use File::Temp qw(tempfile);
+use Time::HiRes qw(time);
+use POSIX qw(strftime);
+
+# Configuration
+my $TIMEOUT = 30;
+my $MAX_LOG_SIZE = 100_000; # 100KB limit
+
+
+# Output level
+my $verbose = 0;
+
+sub usage() {
+    print STDERR "Usage: $0 <healthcheck_url> <command> [args...]\n";
+    print STDERR "Example: $0 http://localhost:3000/ping/uuid-here /path/to/backup.sh\n";
+    exit 1;
+}
+
+sub send_ping($url, $body = '') {
+    my $auth = $ENV{API_KEY} // '00000000-0000-0000-0000-000000000000';
+    my $http = HTTP::Tiny->new(timeout => $TIMEOUT);
+    my $response = $http->post($url, {
+        content => $body,
+        headers => {
+            'Authorization' => "Bearer $auth",
+            'User-Agent' => 'perl-cron-wrapper/1.0',
+            'Content-Type' => 'text/plain'
+        }
+    });
+    
+    unless ($response->{success}) {
+        warn "Failed to send ping to $url: $response->{status} $response->{reason}\n";
+        return 0;
+    }
+    return 1;
+}
+
+sub capture_command($cmd, @args) {
+    # Create temporary files for stdout and stderr
+    my ($stdout_fh, $stdout_file) = tempfile();
+    my ($stderr_fh, $stderr_file) = tempfile();
+    
+    # Prepare full command
+    my @full_cmd = ($cmd, @args);
+    my $cmd_string = join(' ', map { "'$_'" } @full_cmd);
+    
+    # Execute command and capture output
+    my $start_time = time();
+    my $exit_code;
+    
+    # Fork to execute the command
+    my $pid = fork();
+    
+    if (!defined $pid) {
+        die "Failed to fork: $!\n";
+    } elsif ($pid == 0) {
+        # Child process
+        # Redirect stdout and stderr
+        open(STDOUT, '>&', $stdout_fh) or die "Cannot redirect stdout: $!\n";
+        open(STDERR, '>&', $stderr_fh) or die "Cannot redirect stderr: $!\n";
+        
+        # Execute the command
+        exec(@full_cmd) or die "Failed to execute $cmd: $!\n";
+    } else {
+        # Parent process
+        close($stdout_fh);
+        close($stderr_fh);
+        
+        # Wait for child to complete
+        waitpid($pid, 0);
+        $exit_code = $? >> 8;
+    }
+    
+    my $end_time = time();
+    my $duration = sprintf("%.2f", $end_time - $start_time);
+    
+    # Read output files
+    my $stdout = do { 
+        local $/; 
+        if (open my $fh, '<', $stdout_file) {
+            my $content = <$fh>;
+            close($fh);
+            $content // '';
+        } else {
+            '';
+        }
+    };
+    
+    my $stderr = do { 
+        local $/; 
+        if (open my $fh, '<', $stderr_file) {
+            my $content = <$fh>;
+            close($fh);
+            $content // '';
+        } else {
+            '';
+        }
+    };
+    
+    # Clean up temp files
+    unlink($stdout_file, $stderr_file);
+    
+    return {
+        exit_code => $exit_code,
+        stdout => $stdout,
+        stderr => $stderr,
+        duration => $duration,
+        start_time => $start_time,
+        end_time => $end_time
+    };
+}
+
+sub format_report($cmd, $args, $result) {
+    my $start_time = strftime("%Y-%m-%d %H:%M:%S", localtime($result->{start_time}));
+    my $end_time = strftime("%Y-%m-%d %H:%M:%S", localtime($result->{end_time}));
+    
+    my $report = "=== Cron Job Execution Report ===\n";
+    $report .= "Command: $cmd " . join(' ', @$args) . "\n";
+    $report .= "Started: $start_time\n";
+    $report .= "Finished: $end_time\n";
+    $report .= "Duration: $result->{duration} seconds\n";
+    $report .= "Exit Code: $result->{exit_code}\n";
+    $report .= "Host: " . (`hostname` || 'unknown');
+    $report .= "\n";
+    
+    if ($result->{stdout}) {
+        $report .= "=== STDOUT ===\n";
+        $report .= $result->{stdout};
+        $report .= "\n" unless $result->{stdout} =~ /\n$/;
+        $report .= "\n";
+    }
+    
+    if ($result->{stderr}) {
+        $report .= "=== STDERR ===\n";
+        $report .= $result->{stderr};
+        $report .= "\n" unless $result->{stderr} =~ /\n$/;
+        $report .= "\n";
+    }
+    
+    # Truncate if too large
+    if (length($report) > $MAX_LOG_SIZE) {
+        my $half_size = $MAX_LOG_SIZE / 2;
+        my $start = substr($report, 0, $half_size);
+        my $end = substr($report, -$half_size);
+        $report = $start . "\n\n=== LOG TRUNCATED ===\n\n" . $end;
+    }
+    
+    return $report;
+}
+
+if (@ARGV >= 1 and $ARGV[0] eq '--verbose') {
+   $verbose = 1;
+   shift @ARGV;
+}
+
+# Main execution
+usage() unless @ARGV >= 2;
+
+my $healthcheck_url = shift @ARGV;
+my $command = shift @ARGV;
+my @command_args = @ARGV;
+
+# Validate URL
+unless ($healthcheck_url =~ m{^https?://}) {
+    die "Invalid healthcheck URL: $healthcheck_url\n";
+}
+
+# Check if command exists
+unless (-x $command || system("which", $command) == 0) {
+    die "Command not found or not executable: $command\n";
+}
+
+# Send start signal (optional)
+if ($healthcheck_url =~ m{/ping/([^/]+)$}) {
+    my $start_url = $healthcheck_url;
+    $start_url =~ s{/ping/([^/]+)$}{/ping/$1/start};
+    send_ping($start_url, "Job starting");
+}
+
+# Execute the command
+print "Executing: $command " . join(' ', @command_args) . "\n"
+  if $verbose;
+
+my $result = capture_command($command, @command_args);
+
+# Format the report
+my $report = format_report($command, \@command_args, $result);
+
+# Send to healthchecks
+my $ping_url = $healthcheck_url;
+if ($result->{exit_code} != 0) {
+    # Send to failure endpoint
+    $ping_url =~ s{/ping/([^/]+)(?:/start)?$}{/ping/$1/fail};
+}
+
+my $success = send_ping($ping_url, $report);
+
+# Output summary
+if ($verbose) {
+  print "\n" . "="x50 . "\n";
+  print "Job completed with exit code: $result->{exit_code}\n";
+  print "Duration: $result->{duration} seconds\n";
+  print "Healthcheck ping: " . ($success ? "SUCCESS" : "FAILED") . "\n";
+}
+
+# Also output to stderr if there were errors,
+# when requested to be verbose, or when STDERR is a terminal
+# --> errors are reported through the health-check e-mail,
+#     except when --verbose is passed
+if ($result->{exit_code} != 0
+    and ($verbose or -t STDERR)) {
+    print STDERR "CRON JOB FAILED: $command\n";
+    print STDERR "Exit code: $result->{exit_code}\n";
+    print STDERR "Duration: $result->{duration} seconds\n";
+    if ($result->{stderr}) {
+        print STDERR "STDERR:\n$result->{stderr}\n";
+    }
+}
+
+exit $result->{exit_code};
