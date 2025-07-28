@@ -9,6 +9,7 @@
 use strict;
 use warnings;
 use v5.20;
+use experimental qw(postderef);
 
 use Mojolicious::Lite -signatures;
 use DBI;
@@ -85,15 +86,27 @@ sub get_check_by_uuid($uuid) {
 sub update_check_status($uuid, $status, $ping_data = {}) {
     my $now = DateTime->now->strftime('%Y-%m-%d %H:%M:%S');
 
+    # Don't set the status to 'grace' if the ping is already down
     $dbh->do(
-        "UPDATE checks SET status = ?, last_ping = ?, updated_at = ? WHERE uuid = ?",
-        undef, $status, $now, $now, $uuid
+        <<~'SQL',
+          UPDATE checks
+             SET status = ?,
+                 last_ping = ?,
+                 updated_at = ?
+           WHERE uuid = ?
+                 AND (status <> 'down'
+                      AND ? <> 'grace')
+          SQL
+        undef, $status, $now, $now, $uuid, $status
     );
 
     # Log the ping
     $dbh->do(
-        "INSERT INTO pings (check_uuid, method, status, user_agent, body, exit_status) VALUES (?, ?, ?, ?, ?, ?)",
-        undef, $uuid, $ping_data->{method}, $status, $ping_data->{user_agent}, $ping_data->{body}, $ping_data->{exit_status}
+        <<~'SQL',
+          INSERT INTO pings (check_uuid, status, method, user_agent, body, exit_status)
+               VALUES (?, (select status from checks where uuid = ?), ?, ?, ?, ?)
+          SQL
+        undef, $uuid, $uuid, $ping_data->@{ qw( method user_agent body exit_status ) }
     );
 }
 
