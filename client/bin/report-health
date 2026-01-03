@@ -8,6 +8,7 @@ use warnings;
 use v5.20;
 use experimental qw(signatures);
 
+use Getopt::Long;
 use HTTP::Tiny;
 use File::Temp qw(tempfile);
 use Time::HiRes qw(time);
@@ -164,6 +165,11 @@ if (@ARGV >= 1 and $ARGV[0] eq '--verbose') {
    shift @ARGV;
 }
 
+my $expected_exit = 0;
+GetOptions(
+    'exit-code=i'  => \$expected_exit,
+    );
+
 # Main execution
 usage() unless @ARGV >= 2;
 
@@ -199,7 +205,7 @@ my $report = format_report($command, \@command_args, $result);
 
 # Send to healthchecks
 my $ping_url = $healthcheck_url;
-if ($result->{exit_code} != 0) {
+if ($result->{exit_code} != $expected_exit) {
     # Send to failure endpoint
     $ping_url =~ s{/ping/([^/]+)(?:/start)?$}{/ping/$1/fail};
 }
@@ -209,7 +215,7 @@ my $success = send_ping($ping_url, $report);
 # Output summary
 if ($verbose) {
   print "\n" . "="x50 . "\n";
-  print "Job completed with exit code: $result->{exit_code}\n";
+  print "Job completed with exit code: $result->{exit_code} (expected: $expected_exit)\n";
   print "Duration: $result->{duration} seconds\n";
   print "Healthcheck ping: " . ($success ? "SUCCESS" : "FAILED") . "\n";
 }
@@ -218,14 +224,14 @@ if ($verbose) {
 # when requested to be verbose, or when STDERR is a terminal
 # --> errors are reported through the health-check e-mail,
 #     except when --verbose is passed
-if ($result->{exit_code} != 0
+if ($result->{exit_code} != $expected_exit
     and ($verbose or -t STDERR)) {
     print STDERR "CRON JOB FAILED: $command\n";
-    print STDERR "Exit code: $result->{exit_code}\n";
+    print STDERR "Exit code: $result->{exit_code} (expected: $expected_exit)\n";
     print STDERR "Duration: $result->{duration} seconds\n";
     if ($result->{stderr}) {
         print STDERR "STDERR:\n$result->{stderr}\n";
     }
 }
 
-exit $result->{exit_code};
+exit ($result->{exit_code} == $expected_exit ? 0 : ($result->{exit_code} || 1));
