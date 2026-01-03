@@ -38,7 +38,7 @@ sub send_ping($url, $body = '') {
             'Content-Type' => 'text/plain'
         }
     });
-    
+
     unless ($response->{success}) {
         warn "Failed to send ping to $url: $response->{status} $response->{reason}\n";
         return 0;
@@ -50,18 +50,18 @@ sub capture_command($cmd, @args) {
     # Create temporary files for stdout and stderr
     my ($stdout_fh, $stdout_file) = tempfile();
     my ($stderr_fh, $stderr_file) = tempfile();
-    
+
     # Prepare full command
     my @full_cmd = ($cmd, @args);
     my $cmd_string = join(' ', map { "'$_'" } @full_cmd);
-    
+
     # Execute command and capture output
     my $start_time = time();
     my $exit_code;
-    
+
     # Fork to execute the command
     my $pid = fork();
-    
+
     if (!defined $pid) {
         die "Failed to fork: $!\n";
     } elsif ($pid == 0) {
@@ -69,25 +69,25 @@ sub capture_command($cmd, @args) {
         # Redirect stdout and stderr
         open(STDOUT, '>&', $stdout_fh) or die "Cannot redirect stdout: $!\n";
         open(STDERR, '>&', $stderr_fh) or die "Cannot redirect stderr: $!\n";
-        
+
         # Execute the command
         exec(@full_cmd) or die "Failed to execute $cmd: $!\n";
     } else {
         # Parent process
         close($stdout_fh);
         close($stderr_fh);
-        
+
         # Wait for child to complete
         waitpid($pid, 0);
         $exit_code = $? >> 8;
     }
-    
+
     my $end_time = time();
     my $duration = sprintf("%.2f", $end_time - $start_time);
-    
+
     # Read output files
-    my $stdout = do { 
-        local $/; 
+    my $stdout = do {
+        local $/;
         if (open my $fh, '<', $stdout_file) {
             my $content = <$fh>;
             close($fh);
@@ -96,9 +96,9 @@ sub capture_command($cmd, @args) {
             '';
         }
     };
-    
-    my $stderr = do { 
-        local $/; 
+
+    my $stderr = do {
+        local $/;
         if (open my $fh, '<', $stderr_file) {
             my $content = <$fh>;
             close($fh);
@@ -107,10 +107,10 @@ sub capture_command($cmd, @args) {
             '';
         }
     };
-    
+
     # Clean up temp files
     unlink($stdout_file, $stderr_file);
-    
+
     return {
         exit_code => $exit_code,
         stdout => $stdout,
@@ -124,7 +124,7 @@ sub capture_command($cmd, @args) {
 sub format_report($cmd, $args, $result) {
     my $start_time = strftime("%Y-%m-%d %H:%M:%S", localtime($result->{start_time}));
     my $end_time = strftime("%Y-%m-%d %H:%M:%S", localtime($result->{end_time}));
-    
+
     my $report = "=== Cron Job Execution Report ===\n";
     $report .= "Command: $cmd " . join(' ', @$args) . "\n";
     $report .= "Started: $start_time\n";
@@ -133,21 +133,21 @@ sub format_report($cmd, $args, $result) {
     $report .= "Exit Code: $result->{exit_code}\n";
     $report .= "Host: " . (`hostname` || 'unknown');
     $report .= "\n";
-    
+
     if ($result->{stdout}) {
         $report .= "=== STDOUT ===\n";
         $report .= $result->{stdout};
         $report .= "\n" unless $result->{stdout} =~ /\n$/;
         $report .= "\n";
     }
-    
+
     if ($result->{stderr}) {
         $report .= "=== STDERR ===\n";
         $report .= $result->{stderr};
         $report .= "\n" unless $result->{stderr} =~ /\n$/;
         $report .= "\n";
     }
-    
+
     # Truncate if too large
     if (length($report) > $MAX_LOG_SIZE) {
         my $half_size = $MAX_LOG_SIZE / 2;
@@ -155,7 +155,7 @@ sub format_report($cmd, $args, $result) {
         my $end = substr($report, -$half_size);
         $report = $start . "\n\n=== LOG TRUNCATED ===\n\n" . $end;
     }
-    
+
     return $report;
 }
 
